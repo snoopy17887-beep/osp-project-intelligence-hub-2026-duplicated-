@@ -1,0 +1,1834 @@
+
+import { useRef, useState } from "react";
+import * as XLSX from "xlsx";
+import "./App.css";
+
+type AlertInfo = {
+  id: string;
+  sheet: string;
+  cell: string;
+  title: string;
+  detail: string;
+  severity: "critical" | "warning";
+};
+
+type SheetInfo = {
+  name: string;
+  rows: string[][];
+  rowCount: number;
+  columnCount: number;
+  formulaCount: number;
+  errors: { cell: string; value: string }[];
+  alerts: AlertInfo[];
+};
+
+type MatchRecord = {
+  sheet: string;
+  row: number;
+  id: string;
+  name: string;
+};
+
+type MatchInfo = {
+  id: string;
+  type: string;
+  confidence: string;
+  records: MatchRecord[];
+};
+
+type ImportInfo = {
+  name: string;
+  date: string;
+  size: string;
+  sheets: number;
+  rows: number;
+};
+
+type Dimension = {
+  key: string;
+  label: string;
+  aliases: string[];
+};
+
+const DIMENSIONS: Dimension[] = [
+  {
+    key: "country",
+    label: "Countries",
+    aliases: ["country", "projectcountry", "locationcountry"],
+  },
+  {
+    key: "nationality",
+    label: "Nationalities",
+    aliases: ["nationality", "citizenship"],
+  },
+  {
+    key: "gender",
+    label: "Gender",
+    aliases: ["gender", "sex"],
+  },
+  {
+    key: "status",
+    label: "Project Status",
+    aliases: ["status", "projectstatus", "currentstatus"],
+  },
+  {
+    key: "sector",
+    label: "Project Sectors",
+    aliases: ["sector", "projectsector"],
+  },
+  {
+    key: "funder",
+    label: "Funders & Donors",
+    aliases: ["funder", "donor", "fundingagency", "fundingsource"],
+  },
+  {
+    key: "year",
+    label: "Project Year",
+    aliases: ["year", "projectyear", "startyear"],
+  },
+];
+
+const COLORS = [
+  "#4778d0",
+  "#36a58b",
+  "#e3a64c",
+  "#8d70ca",
+  "#dc727b",
+  "#53a6bb",
+  "#9b9da8",
+  "#6c9b57",
+  "#bd83a5",
+  "#d17b43",
+];
+
+function normalize(value: string) {
+  return String(value ?? "")
+    .toLowerCase()
+    .trim()
+    .replace(/&/g, "and")
+    .replace(/[^a-z0-9]/g, "");
+}
+
+function findColumn(headers: string[], aliases: string[]) {
+  const normalizedHeaders = headers.map(normalize);
+
+  return normalizedHeaders.findIndex((header) =>
+    aliases.some(
+      (alias) =>
+        header === normalize(alias) ||
+        header.includes(normalize(alias))
+    )
+  );
+}
+
+function similarity(a: string, b: string) {
+  const first = normalize(a);
+  const second = normalize(b);
+
+  if (!first || !second) return 0;
+  if (first === second) return 1;
+
+  if (first.length < 3 || second.length < 3) return 0;
+
+  function bigrams(value: string) {
+    const result = new Set<string>();
+
+    for (let i = 0; i < value.length - 1; i++) {
+      result.add(value.slice(i, i + 2));
+    }
+
+    return result;
+  }
+
+  const aPairs = bigrams(first);
+  const bPairs = bigrams(second);
+
+  let intersection = 0;
+
+  aPairs.forEach((pair) => {
+    if (bPairs.has(pair)) intersection++;
+  });
+
+  return (2 * intersection) / (aPairs.size + bPairs.size);
+}
+
+function collectDimension(
+  sheets: SheetInfo[],
+  dimension: Dimension,
+  selectedSheet?: string
+) {
+  const counts = new Map<string, number>();
+  let found = false;
+
+  const targetSheets = selectedSheet
+    ? sheets.filter((sheet) => sheet.name === selectedSheet)
+    : sheets;
+
+  targetSheets.forEach((sheet) => {
+    const headers = sheet.rows[0] || [];
+    const column = findColumn(headers, dimension.aliases);
+
+    if (column === -1) return;
+
+    found = true;
+
+    sheet.rows.slice(1).forEach((row) => {
+      const value = String(row[column] ?? "").trim();
+
+      if (!value) return;
+      if (value === "—") return;
+
+      counts.set(value, (counts.get(value) || 0) + 1);
+    });
+  });
+
+  return {
+    found,
+    data: Array.from(counts.entries())
+      .map(([label, value]) => ({ label, value }))
+      .sort((a, b) => b.value - a.value),
+  };
+}
+
+function buildMatches(sheets: SheetInfo[]): MatchInfo[] {
+  const records: MatchRecord[] = [];
+
+  sheets.forEach((sheet) => {
+    const headers = sheet.rows[0] || [];
+
+    const idColumn = findColumn(headers, [
+      "projectid",
+      "projectcode",
+      "projectnumber",
+      "projectno",
+    ]);
+
+    const nameColumn = findColumn(headers, [
+      "projectname",
+      "projecttitle",
+    ]);
+
+    if (idColumn === -1 && nameColumn === -1) return;
+
+    sheet.rows.slice(1).forEach((row, index) => {
+      const id =
+        idColumn >= 0 ? String(row[idColumn] ?? "").trim() : "";
+
+      const name =
+        nameColumn >= 0 ? String(row[nameColumn] ?? "").trim() : "";
+
+      if (!id && !name) return;
+
+      records.push({
+        sheet: sheet.name,
+        row: index + 2,
+        id,
+        name,
+      });
+    });
+  });
+
+  const matches: MatchInfo[] = [];
+  const usedPairs = new Set<string>();
+
+  function addMatch(
+    type: string,
+    confidence: string,
+    group: MatchRecord[]
+  ) {
+    if (group.length < 2) return;
+
+    const unique = group.filter(
+      (record, index, array) =>
+        array.findIndex(
+          (item) =>
+            item.sheet === record.sheet && item.row === record.row
+        ) === index
+    );
+
+    if (unique.length < 2) return;
+
+    const key = unique
+      .map((record) => `${record.sheet}:${record.row}`)
+      .sort()
+      .join("|");
+
+    if (usedPairs.has(key)) return;
+    usedPairs.add(key);
+
+    matches.push({
+      id: `${type}-${matches.length}`,
+      type,
+      confidence,
+      records: unique,
+    });
+  }
+
+  // Exact Project ID matches across all worksheets.
+  const idGroups = new Map<string, MatchRecord[]>();
+
+  records.forEach((record) => {
+    if (!record.id) return;
+
+    const key = normalize(record.id);
+    const group = idGroups.get(key) || [];
+
+    group.push(record);
+    idGroups.set(key, group);
+  });
+
+  idGroups.forEach((group) => {
+    if (group.length > 1) {
+      addMatch("Exact Project ID", "High", group);
+    }
+  });
+
+  // Exact Project Name matches.
+  const nameGroups = new Map<string, MatchRecord[]>();
+
+  records.forEach((record) => {
+    if (!record.name) return;
+
+    const key = normalize(record.name);
+    const group = nameGroups.get(key) || [];
+
+    group.push(record);
+    nameGroups.set(key, group);
+  });
+
+  nameGroups.forEach((group) => {
+    if (group.length > 1) {
+      addMatch("Exact Project Name", "High", group);
+    }
+  });
+
+  // Potentially similar project names.
+  const namedRecords = records.filter((record) => record.name);
+
+  // Avoid an expensive all-pairs comparison on very large workbooks.
+  const comparisonRecords = namedRecords.slice(0, 3000);
+
+  for (let i = 0; i < comparisonRecords.length; i++) {
+    for (let j = i + 1; j < comparisonRecords.length; j++) {
+      const first = comparisonRecords[i];
+      const second = comparisonRecords[j];
+
+      if (normalize(first.name) === normalize(second.name)) continue;
+
+      const score = similarity(first.name, second.name);
+
+      if (score >= 0.88) {
+        addMatch("Possible Similar Project Name", "Review", [
+          first,
+          second,
+        ]);
+      }
+    }
+  }
+
+  return matches;
+}
+
+function DonutChart({
+  title,
+  description,
+  data,
+}: {
+  title: string;
+  description: string;
+  data: { label: string; value: number }[];
+}) {
+  const [selected, setSelected] = useState(-1);
+
+  const total = data.reduce((sum, item) => sum + item.value, 0);
+
+  let currentAngle = 0;
+
+  const segments = data.map((item, index) => {
+    const start = currentAngle;
+    const end = start + (item.value / total) * 360;
+    currentAngle = end;
+
+    return `${COLORS[index % COLORS.length]} ${start}deg ${end}deg`;
+  });
+
+  const background =
+    total > 0
+      ? `conic-gradient(${segments.join(", ")})`
+      : "#e8eaf0";
+
+  return (
+    <div className="panel" style={{ padding: "22px", minWidth: 0 }}>
+      <div className="eyebrow">DATA DISTRIBUTION</div>
+      <h3 style={{ margin: "8px 0 4px" }}>{title}</h3>
+      <p className="workflow-intro">{description}</p>
+
+      {total === 0 ? (
+        <div className="empty-activity" style={{ marginTop: 15 }}>
+          <div className="empty-icon">◉</div>
+          <strong>No available data</strong>
+          <p>No matching column or populated values were found.</p>
+        </div>
+      ) : (
+        <>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              padding: "22px 0",
+            }}
+          >
+            <div
+              style={{
+                width: 190,
+                height: 190,
+                borderRadius: "50%",
+                background,
+                display: "grid",
+                placeItems: "center",
+                position: "relative",
+              }}
+            >
+              <div
+                style={{
+                  width: 118,
+                  height: 118,
+                  borderRadius: "50%",
+                  background: "var(--card-background, white)",
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "center",
+                  justifyContent: "center",
+                }}
+              >
+                <strong style={{ fontSize: 27 }}>
+                  {total.toLocaleString()}
+                </strong>
+                <small style={{ opacity: 0.65 }}>Records</small>
+              </div>
+            </div>
+          </div>
+
+          <div style={{ display: "grid", gap: 9 }}>
+            {data.map((item, index) => {
+              const percentage = (item.value / total) * 100;
+
+              return (
+                <button
+                  key={item.label}
+                  onClick={() =>
+                    setSelected(selected === index ? -1 : index)
+                  }
+                  style={{
+                    border: "1px solid var(--border-color, #e5e7eb)",
+                    background:
+                      selected === index
+                        ? "var(--card-background, #f5f7fb)"
+                        : "transparent",
+                    borderRadius: 8,
+                    padding: "9px 11px",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 9,
+                    cursor: "pointer",
+                    textAlign: "left",
+                    color: "inherit",
+                    width: "100%",
+                  }}
+                >
+                  <span
+                    style={{
+                      width: 10,
+                      height: 10,
+                      borderRadius: 3,
+                      background: COLORS[index % COLORS.length],
+                      flexShrink: 0,
+                    }}
+                  />
+
+                  <span style={{ flex: 1, fontSize: 13 }}>
+                    {item.label}
+                  </span>
+
+                  <strong style={{ fontSize: 13 }}>
+                    {item.value.toLocaleString()}
+                  </strong>
+
+                  <small style={{ opacity: 0.65, minWidth: 45 }}>
+                    {percentage.toFixed(1)}%
+                  </small>
+                </button>
+              );
+            })}
+          </div>
+
+          {selected >= 0 && (
+            <div
+              style={{
+                marginTop: 12,
+                padding: 12,
+                borderRadius: 8,
+                background: "var(--card-background, #f5f7fb)",
+                fontSize: 13,
+              }}
+            >
+              <strong>{data[selected].label}</strong>
+              <p>
+                {data[selected].value} records (
+                {((data[selected].value / total) * 100).toFixed(1)}%).
+              </p>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function BarChart({
+  title,
+  data,
+}: {
+  title: string;
+  data: { label: string; value: number }[];
+}) {
+  const maximum = Math.max(...data.map((item) => item.value), 1);
+
+  return (
+    <div className="panel" style={{ padding: 22 }}>
+      <div className="eyebrow">COMPARATIVE ANALYSIS</div>
+      <h3 style={{ margin: "8px 0 18px" }}>{title}</h3>
+
+      {data.length === 0 ? (
+        <p className="workflow-intro">No available data for this analysis.</p>
+      ) : (
+        <div style={{ display: "grid", gap: 15 }}>
+          {data.slice(0, 12).map((item, index) => (
+            <div key={item.label}>
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  gap: 10,
+                  fontSize: 13,
+                  marginBottom: 6,
+                }}
+              >
+                <span>{item.label}</span>
+                <strong>{item.value.toLocaleString()}</strong>
+              </div>
+
+              <div
+                style={{
+                  height: 9,
+                  borderRadius: 20,
+                  background: "#e9edf4",
+                  overflow: "hidden",
+                }}
+              >
+                <div
+                  style={{
+                    height: "100%",
+                    width: `${(item.value / maximum) * 100}%`,
+                    background: COLORS[index % COLORS.length],
+                    borderRadius: 20,
+                  }}
+                />
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function App() {
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [activePage, setActivePage] = useState("Overview");
+  const [sheets, setSheets] = useState<SheetInfo[]>([]);
+  const [selectedSheet, setSelectedSheet] = useState("");
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [errorMessage, setErrorMessage] = useState("");
+  const [history, setHistory] = useState<ImportInfo[]>([]);
+  const [searchText, setSearchText] = useState("");
+  const fileInput = useRef<HTMLInputElement>(null);
+
+  const navigation = [
+    { name: "Overview", icon: "◫" },
+    { name: "Excel Intelligence", icon: "▦" },
+    { name: "Project Matching", icon: "⌕" },
+    { name: "Data Validation", icon: "✓" },
+    { name: "Sheet Summary", icon: "◉" },
+    { name: "Import History", icon: "↻" },
+    { name: "Settings", icon: "⚙" },
+  ];
+
+  const totalRows = sheets.reduce(
+    (sum, sheet) => sum + sheet.rowCount,
+    0
+  );
+
+  const totalErrors = sheets.reduce(
+    (sum, sheet) => sum + sheet.errors.length,
+    0
+  );
+
+  const totalFormulas = sheets.reduce(
+    (sum, sheet) => sum + sheet.formulaCount,
+    0
+  );
+
+  const allAlerts = sheets.flatMap((sheet) => sheet.alerts);
+  const totalAlerts = allAlerts.length;
+
+  const currentSheet = sheets.find(
+    (sheet) => sheet.name === selectedSheet
+  );
+
+  const matches = buildMatches(sheets);
+
+  async function handleFile(file?: File) {
+    if (!file) return;
+
+    const validExtension = /\.(xlsx|xls|csv)$/i.test(file.name);
+
+    if (!validExtension) {
+      setErrorMessage("Please select an Excel or CSV file.");
+      return;
+    }
+
+    if (file.size > 20 * 1024 * 1024) {
+      setErrorMessage("File is too large. Maximum size is 20 MB.");
+      return;
+    }
+
+    setSelectedFile(file);
+    setSheets([]);
+    setSelectedSheet("");
+    setErrorMessage("");
+    setIsProcessing(true);
+
+    try {
+      const buffer = await file.arrayBuffer();
+
+      const workbook = XLSX.read(buffer, {
+        type: "array",
+        cellFormula: true,
+        cellStyles: false,
+      });
+
+      const results: SheetInfo[] = workbook.SheetNames.map((name) => {
+        const worksheet = workbook.Sheets[name];
+
+        const range = worksheet["!ref"]
+          ? XLSX.utils.decode_range(worksheet["!ref"])
+          : null;
+
+        const rows: string[][] = [];
+        let formulaCount = 0;
+
+        const errors: { cell: string; value: string }[] = [];
+        const alerts: AlertInfo[] = [];
+
+        const excelErrorPattern =
+          /^#(?:REF!|VALUE!|DIV\/0!|NAME\?|N\/A|NUM!|NULL!|SPILL!|CALC!|GETTING_DATA)$/i;
+
+        if (range) {
+          for (let row = range.s.r; row <= range.e.r; row++) {
+            const currentRow: string[] = [];
+
+            for (let col = range.s.c; col <= range.e.c; col++) {
+              const address = XLSX.utils.encode_cell({
+                r: row,
+                c: col,
+              });
+
+              const cell = worksheet[address];
+
+              if (cell?.f) formulaCount++;
+
+              const displayedValue = cell
+                ? String(
+                    cell.w ??
+                      (cell.t === "e"
+                        ? cell.v
+                        : cell.v ?? "")
+                  ).trim()
+                : "";
+
+              currentRow.push(displayedValue);
+
+              const isExcelError =
+                cell?.t === "e" ||
+                excelErrorPattern.test(displayedValue);
+
+              if (isExcelError) {
+                errors.push({
+                  cell: address,
+                  value: displayedValue || "Excel error",
+                });
+
+                alerts.push({
+                  id: `${name}-${address}-excel`,
+                  sheet: name,
+                  cell: address,
+                  title: "Excel Formula Error",
+                  detail: `An Excel error was detected: ${displayedValue || "Excel error"}`,
+                  severity: "critical",
+                });
+              }
+            }
+
+            rows.push(currentRow);
+          }
+        }
+
+        const headerRow = rows[0] || [];
+
+        const projectIdColumn = findColumn(headerRow, [
+          "projectid",
+          "projectcode",
+          "projectnumber",
+          "projectno",
+        ]);
+
+        const projectNameColumn = findColumn(headerRow, [
+          "projectname",
+          "projecttitle",
+        ]);
+
+        const idOccurrences = new Map<
+          string,
+          { rowNumber: number; cell: string }[]
+        >();
+
+        const nameOccurrences = new Map<
+          string,
+          { rowNumber: number; cell: string }[]
+        >();
+
+        rows.slice(1).forEach((row, index) => {
+          if (!row.some((value) => value.trim() !== "")) return;
+
+          const actualRow = (range?.s.r ?? 0) + index + 1;
+          const rowNumber = actualRow + 1;
+
+          if (projectIdColumn !== -1) {
+            const projectId = (row[projectIdColumn] || "").trim();
+
+            const idCell = XLSX.utils.encode_cell({
+              r: actualRow,
+              c: (range?.s.c ?? 0) + projectIdColumn,
+            });
+
+            if (!projectId) {
+              alerts.push({
+                id: `${name}-${idCell}-missing-id`,
+                sheet: name,
+                cell: idCell,
+                title: "Missing Project ID",
+                detail: `Project ID is empty in row ${rowNumber}.`,
+                severity: "warning",
+              });
+            } else {
+              const group = idOccurrences.get(normalize(projectId)) || [];
+              group.push({ rowNumber, cell: idCell });
+              idOccurrences.set(normalize(projectId), group);
+            }
+          }
+
+          if (projectNameColumn !== -1) {
+            const projectName = (
+              row[projectNameColumn] || ""
+            ).trim();
+
+            const nameCell = XLSX.utils.encode_cell({
+              r: actualRow,
+              c: (range?.s.c ?? 0) + projectNameColumn,
+            });
+
+            if (!projectName) {
+              alerts.push({
+                id: `${name}-${nameCell}-missing-name`,
+                sheet: name,
+                cell: nameCell,
+                title: "Missing Project Name",
+                detail: `Project name is empty in row ${rowNumber}.`,
+                severity: "warning",
+              });
+            } else {
+              const group =
+                nameOccurrences.get(normalize(projectName)) || [];
+
+              group.push({ rowNumber, cell: nameCell });
+              nameOccurrences.set(normalize(projectName), group);
+            }
+          }
+        });
+
+        idOccurrences.forEach((occurrences, projectId) => {
+          if (occurrences.length < 2) return;
+
+          occurrences.slice(1).forEach((duplicate) => {
+            alerts.push({
+              id: `${name}-${duplicate.cell}-duplicate-id`,
+              sheet: name,
+              cell: duplicate.cell,
+              title: "Duplicate Project ID",
+              detail: `Project ID "${projectId}" appears more than once. First occurrence: row ${occurrences[0].rowNumber}.`,
+              severity: "warning",
+            });
+          });
+        });
+
+        nameOccurrences.forEach((occurrences, projectName) => {
+          if (occurrences.length < 2) return;
+
+          occurrences.slice(1).forEach((duplicate) => {
+            alerts.push({
+              id: `${name}-${duplicate.cell}-duplicate-name`,
+              sheet: name,
+              cell: duplicate.cell,
+              title: "Possible Duplicate Project",
+              detail: `Project name "${projectName}" appears more than once. First occurrence: row ${occurrences[0].rowNumber}.`,
+              severity: "warning",
+            });
+          });
+        });
+
+        const columnCount = rows.reduce(
+          (max, row) => Math.max(max, row.length),
+          0
+        );
+
+        return {
+          name,
+          rows,
+          rowCount: Math.max(rows.length - 1, 0),
+          columnCount,
+          formulaCount,
+          errors,
+          alerts,
+        };
+      });
+
+      setSheets(results);
+
+      if (results.length > 0) {
+        setSelectedSheet(results[0].name);
+      }
+
+      const rowTotal = results.reduce(
+        (sum, sheet) => sum + sheet.rowCount,
+        0
+      );
+
+      setHistory((previous) => [
+        {
+          name: file.name,
+          date: new Date().toLocaleString(),
+          size: `${(file.size / 1024 / 1024).toFixed(2)} MB`,
+          sheets: results.length,
+          rows: rowTotal,
+        },
+        ...previous,
+      ]);
+
+      setActivePage("Overview");
+    } catch (error) {
+      console.error("Excel processing error:", error);
+
+      setErrorMessage(
+        "The workbook could not be read. Please check that the file is valid and try again."
+      );
+    } finally {
+      setIsProcessing(false);
+    }
+  }
+
+  function removeFile() {
+    setSelectedFile(null);
+    setSheets([]);
+    setSelectedSheet("");
+    setErrorMessage("");
+    setSearchText("");
+
+    if (fileInput.current) {
+      fileInput.current.value = "";
+    }
+  }
+
+  function openAlert(alert: AlertInfo) {
+    setSelectedSheet(alert.sheet);
+    setActivePage("Excel Intelligence");
+  }
+
+  function renderUpload() {
+    return (
+      <div className="panel upload-panel">
+        <div className="panel-header">
+          <div>
+            <div className="eyebrow">DATA INPUT</div>
+            <h2>Upload your workbook</h2>
+            <p>Select an OSP Excel database to begin analysis.</p>
+          </div>
+          <div className="panel-icon">↑</div>
+        </div>
+
+        <div
+          className="upload-area"
+          onDragOver={(event) => event.preventDefault()}
+          onDrop={(event) => {
+            event.preventDefault();
+            handleFile(event.dataTransfer.files[0]);
+          }}
+          onClick={() => fileInput.current?.click()}
+        >
+          <input
+            ref={fileInput}
+            type="file"
+            accept=".xlsx,.xls,.csv"
+            hidden
+            onChange={(event) =>
+              handleFile(event.target.files?.[0])
+            }
+          />
+
+          <div className="upload-icon">↑</div>
+
+          <h3>
+            {isProcessing
+              ? "Reading your workbook..."
+              : "Drop your file here"}
+          </h3>
+
+          <p>
+            {isProcessing
+              ? "Please wait while worksheets are processed"
+              : "or click to browse your computer"}
+          </p>
+
+          <span className="file-types">XLSX · XLS · CSV</span>
+        </div>
+
+        {selectedFile && (
+          <div className="selected-file">
+            <div className="file-symbol">XLS</div>
+
+            <div className="file-info">
+              <strong>{selectedFile.name}</strong>
+              <small>
+                {(selectedFile.size / 1024 / 1024).toFixed(2)} MB ·
+                {isProcessing ? " Processing..." : " Read successfully"}
+              </small>
+            </div>
+
+            <button className="remove-file" onClick={removeFile}>
+              ×
+            </button>
+          </div>
+        )}
+
+        {errorMessage && (
+          <div className="error-message">{errorMessage}</div>
+        )}
+
+        <div className="upload-footer">
+          <span>
+            <span className="secure-dot" /> Read-only processing
+          </span>
+          <span>Maximum file size: 20 MB</span>
+        </div>
+      </div>
+    );
+  }
+
+  function renderStats() {
+    return (
+      <section className="stats-grid">
+        {[
+          ["WORKSHEETS READ", sheets.length, "Worksheets processed"],
+          ["DATA ROWS FOUND", totalRows.toLocaleString(), "Across all worksheets"],
+          ["NOTIFICATIONS", totalAlerts, "Items requiring review"],
+          ["FORMULAS FOUND", totalFormulas.toLocaleString(), "Formula cells identified"],
+        ].map((item) => (
+          <div className="stat-card" key={String(item[0])}>
+            <div className="stat-heading">{item[0]}</div>
+            <div className="stat-value">{item[1]}</div>
+            <div className="stat-note">{item[2]}</div>
+          </div>
+        ))}
+      </section>
+    );
+  }
+
+  function renderOverview() {
+    return (
+      <>
+        <section className="welcome-section">
+          <div>
+            <div className="eyebrow">PROJECT INTELLIGENCE SYSTEM</div>
+            <h1>Workbook Overview</h1>
+            <p>
+              A complete view of your OSP data, project records,
+              demographics and validation results.
+            </p>
+          </div>
+          <div className="welcome-mark">AI</div>
+        </section>
+
+        {renderStats()}
+
+        {sheets.length === 0 ? (
+          <section className="content-grid">
+            {renderUpload()}
+
+            <div className="panel workflow-panel">
+              <div className="eyebrow">HOW IT WORKS</div>
+              <h2>Intelligent data workflow</h2>
+              <p className="workflow-intro">
+                Every workbook passes through controlled analysis stages.
+              </p>
+
+              {[
+                ["01", "Workbook Analysis", "Read sheets, columns and values"],
+                ["02", "Data Understanding", "Identify project and demographic fields"],
+                ["03", "Data Validation", "Find duplicates and Excel errors"],
+                ["04", "Human Approval", "Review proposed changes"],
+                ["05", "Database Sync", "Future approved synchronization"],
+              ].map((step) => (
+                <div className="workflow-step" key={step[0]}>
+                  <div className="step-number">{step[0]}</div>
+                  <div className="step-text">
+                    <strong>{step[1]}</strong>
+                    <small>{step[2]}</small>
+                  </div>
+                  <span className="step-state">READY</span>
+                </div>
+              ))}
+            </div>
+          </section>
+        ) : (
+          <>
+            <div className="activity-heading" style={{ margin: "26px 0 15px" }}>
+              <div>
+                <div className="eyebrow">WORKBOOK ANALYTICS</div>
+                <h2>Data Distribution</h2>
+                <p className="workflow-intro">
+                  Combined analysis across all worksheets. Counts represent
+                  populated records, not necessarily unique people.
+                </p>
+              </div>
+              <button
+                className="empty-label"
+                onClick={() => setActivePage("Sheet Summary")}
+              >
+                OPEN FULL ANALYSIS →
+              </button>
+            </div>
+
+            <div className="grid" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(280px,1fr))", gap: 18 }}>
+              {DIMENSIONS.slice(0, 4).map((dimension) => {
+                const result = collectDimension(sheets, dimension);
+
+                return (
+                  <DonutChart
+                    key={dimension.key}
+                    title={dimension.label}
+                    description="All available workbook records"
+                    data={result.found ? result.data : []}
+                  />
+                );
+              })}
+            </div>
+
+            <div
+              className="grid"
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit,minmax(280px,1fr))",
+                gap: 18,
+                marginTop: 18,
+              }}
+            >
+              {DIMENSIONS.slice(4).map((dimension) => {
+                const result = collectDimension(sheets, dimension);
+
+                return (
+                  <DonutChart
+                    key={dimension.key}
+                    title={dimension.label}
+                    description="All available workbook records"
+                    data={result.found ? result.data : []}
+                  />
+                );
+              })}
+            </div>
+
+            <div className="content-grid" style={{ marginTop: 20 }}>
+              <div className="panel">
+                <div className="eyebrow">WORKSHEET INVENTORY</div>
+                <h2>Imported worksheets</h2>
+                <div className="sheet-list">
+                  {sheets.map((sheet) => (
+                    <button
+                      key={sheet.name}
+                      className="sheet-card"
+                      onClick={() => {
+                        setSelectedSheet(sheet.name);
+                        setActivePage("Excel Intelligence");
+                      }}
+                    >
+                      <strong>{sheet.name}</strong>
+                      <span>{sheet.rowCount.toLocaleString()} rows</span>
+                      <small>{sheet.columnCount} columns</small>
+                      {sheet.alerts.length > 0 && (
+                        <span className="sheet-error">
+                          {sheet.alerts.length} alerts
+                        </span>
+                      )}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="panel">
+                <div className="eyebrow">SMART MONITORING</div>
+                <h2>Notification Center</h2>
+                {allAlerts.length === 0 ? (
+                  <div className="empty-activity">
+                    <div className="empty-icon">✓</div>
+                    <strong>No supported issues detected</strong>
+                    <p>There are no current validation alerts.</p>
+                  </div>
+                ) : (
+                  <div style={{ display: "grid", gap: 9, marginTop: 15 }}>
+                    {allAlerts.slice(0, 8).map((alert) => (
+                      <button
+                        key={alert.id}
+                        onClick={() => openAlert(alert)}
+                        style={{
+                          padding: 12,
+                          border: "1px solid var(--border-color, #ddd)",
+                          borderRadius: 8,
+                          background: "transparent",
+                          color: "inherit",
+                          textAlign: "left",
+                          cursor: "pointer",
+                        }}
+                      >
+                        <strong>{alert.title}</strong>
+                        <p style={{ fontSize: 12, margin: "5px 0" }}>
+                          {alert.sheet} · {alert.cell}
+                        </p>
+                      </button>
+                    ))}
+                  </div>
+                )}
+                <button
+                  className="empty-label"
+                  style={{ marginTop: 12 }}
+                  onClick={() => setActivePage("Data Validation")}
+                >
+                  VIEW ALL VALIDATION RESULTS →
+                </button>
+              </div>
+            </div>
+          </>
+        )}
+      </>
+    );
+  }
+
+  function renderExcelIntelligence() {
+    return (
+      <>
+        <section className="welcome-section">
+          <div>
+            <div className="eyebrow">WORKBOOK EXPLORER</div>
+            <h1>Excel Intelligence</h1>
+            <p>Explore the complete contents of every imported worksheet.</p>
+          </div>
+          <div className="welcome-mark">XLS</div>
+        </section>
+
+        {!sheets.length ? (
+          renderUpload()
+        ) : (
+          <>
+            <div className="panel" style={{ padding: 20 }}>
+              <div className="activity-heading">
+                <div>
+                  <h2>Worksheet Explorer</h2>
+                  <p className="workflow-intro">
+                    Select a worksheet to view its complete contents.
+                  </p>
+                </div>
+                <span className="empty-label">READ ONLY</span>
+              </div>
+
+              <div className="sheet-list">
+                {sheets.map((sheet) => (
+                  <button
+                    key={sheet.name}
+                    className={`sheet-card ${selectedSheet === sheet.name ? "selected" : ""}`}
+                    onClick={() => setSelectedSheet(sheet.name)}
+                  >
+                    <strong>{sheet.name}</strong>
+                    <span>{sheet.rowCount.toLocaleString()} rows</span>
+                    <small>{sheet.columnCount} columns</small>
+                    {sheet.alerts.length > 0 && (
+                      <span className="sheet-error">
+                        {sheet.alerts.length} alerts
+                      </span>
+                    )}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {currentSheet && (
+              <div className="panel analysis-panel" style={{ marginTop: 20 }}>
+                <div className="preview-heading">
+                  <div>
+                    <h3>{currentSheet.name}</h3>
+                    <p>
+                      All worksheet rows and columns · Read-only
+                    </p>
+                  </div>
+                  <div className="preview-metrics">
+                    <span>{currentSheet.rowCount} rows</span>
+                    <span>{currentSheet.columnCount} columns</span>
+                    <span>{currentSheet.formulaCount} formulas</span>
+                  </div>
+                </div>
+
+                <input
+                  value={searchText}
+                  onChange={(event) => setSearchText(event.target.value)}
+                  placeholder="Search within this worksheet..."
+                  style={{
+                    width: "100%",
+                    padding: 12,
+                    margin: "15px 0",
+                    border: "1px solid var(--border-color, #ddd)",
+                    borderRadius: 8,
+                  }}
+                />
+
+                <div className="table-scroll">
+                  <table className="preview-table">
+                    <tbody>
+                      {currentSheet.rows.map((row, rowIndex) => {
+                        const matchesSearch =
+                          !searchText ||
+                          row.some((cell) =>
+                            cell.toLowerCase().includes(searchText.toLowerCase())
+                          );
+
+                        if (!matchesSearch) return null;
+
+                        return (
+                          <tr key={rowIndex}>
+                            {row.map((cell, cellIndex) =>
+                              rowIndex === 0 ? (
+                                <th key={cellIndex}>
+                                  {cell || `Column ${cellIndex + 1}`}
+                                </th>
+                              ) : (
+                                <td key={cellIndex}>
+                                  {cell || "—"}
+                                </td>
+                              )
+                            )}
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+
+                {currentSheet.errors.length > 0 && (
+                  <div className="detected-errors">
+                    <h3>Detected Excel errors</h3>
+                    {currentSheet.errors.map((error) => (
+                      <div className="detected-error" key={error.cell}>
+                        <strong>{error.cell}</strong>
+                        <span>{error.value}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </>
+        )}
+      </>
+    );
+  }
+
+  function renderProjectMatching() {
+    return (
+      <>
+        <section className="welcome-section">
+          <div>
+            <div className="eyebrow">CROSS-WORKSHEET COMPARISON</div>
+            <h1>Project Matching</h1>
+            <p>
+              Identify repeated project IDs and similar project names
+              across all imported worksheets.
+            </p>
+          </div>
+          <div className="welcome-mark">⌕</div>
+        </section>
+
+        <section className="stats-grid">
+          <div className="stat-card">
+            <div className="stat-heading">MATCH GROUPS</div>
+            <div className="stat-value">{matches.length}</div>
+            <div className="stat-note">Potential matches found</div>
+          </div>
+          <div className="stat-card">
+            <div className="stat-heading">RECORDS COMPARED</div>
+            <div className="stat-value">
+              {sheets.reduce((sum, sheet) => sum + sheet.rowCount, 0)}
+            </div>
+            <div className="stat-note">Across available project records</div>
+          </div>
+          <div className="stat-card">
+            <div className="stat-heading">WORKSHEETS</div>
+            <div className="stat-value">{sheets.length}</div>
+            <div className="stat-note">Included in comparison</div>
+          </div>
+          <div className="stat-card">
+            <div className="stat-heading">AUTOMATIC MERGES</div>
+            <div className="stat-value">0</div>
+            <div className="stat-note">No source data is modified</div>
+          </div>
+        </section>
+
+        <div className="panel" style={{ padding: 22, marginTop: 20 }}>
+          <div className="eyebrow">MATCHING RESULTS</div>
+          <h2>Detected project similarities</h2>
+          <p className="workflow-intro">
+            Exact matches and possible name similarities are separated.
+            Review every result before making any decision.
+          </p>
+
+          {sheets.length === 0 ? (
+            <div className="empty-activity">
+              <strong>No workbook loaded</strong>
+              <p>Upload a workbook to start project comparison.</p>
+            </div>
+          ) : matches.length === 0 ? (
+            <div className="empty-activity">
+              <strong>No matching records detected</strong>
+              <p>
+                Matching requires project ID or project name columns.
+              </p>
+            </div>
+          ) : (
+            <div style={{ display: "grid", gap: 14, marginTop: 18 }}>
+              {matches.map((match) => (
+                <div
+                  key={match.id}
+                  style={{
+                    border: "1px solid var(--border-color, #ddd)",
+                    borderRadius: 10,
+                    padding: 16,
+                  }}
+                >
+                  <div className="activity-heading">
+                    <div>
+                      <strong>{match.type}</strong>
+                      <p className="workflow-intro">
+                        Confidence: {match.confidence}
+                      </p>
+                    </div>
+                    <span className="empty-label">
+                      {match.records.length} RECORDS
+                    </span>
+                  </div>
+
+                  {match.records.map((record, index) => (
+                    <div
+                      key={`${record.sheet}-${record.row}`}
+                      style={{
+                        padding: 10,
+                        marginTop: 8,
+                        borderRadius: 7,
+                        background: "var(--card-background, #f7f8fa)",
+                        fontSize: 13,
+                      }}
+                    >
+                      <strong>{record.name || "Unnamed project"}</strong>
+                      <p style={{ margin: "5px 0 0" }}>
+                        ID: {record.id || "Not available"} · Sheet:{" "}
+                        {record.sheet} · Row: {record.row}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </>
+    );
+  }
+
+  function renderValidation() {
+    return (
+      <>
+        <section className="welcome-section">
+          <div>
+            <div className="eyebrow">DATA QUALITY MONITORING</div>
+            <h1>Data Validation</h1>
+            <p>
+              Review formula errors, missing project fields and
+              duplicate records without changing the source workbook.
+            </p>
+          </div>
+          <div className="welcome-mark">✓</div>
+        </section>
+
+        <section className="stats-grid">
+          <div className="stat-card">
+            <div className="stat-heading">TOTAL ALERTS</div>
+            <div className="stat-value">{totalAlerts}</div>
+            <div className="stat-note">All validation findings</div>
+          </div>
+          <div className="stat-card">
+            <div className="stat-heading">EXCEL ERRORS</div>
+            <div className="stat-value">{totalErrors}</div>
+            <div className="stat-note">Formula or cell errors</div>
+          </div>
+          <div className="stat-card">
+            <div className="stat-heading">CRITICAL</div>
+            <div className="stat-value">
+              {allAlerts.filter((a) => a.severity === "critical").length}
+            </div>
+            <div className="stat-note">Excel errors</div>
+          </div>
+          <div className="stat-card">
+            <div className="stat-heading">WARNINGS</div>
+            <div className="stat-value">
+              {allAlerts.filter((a) => a.severity === "warning").length}
+            </div>
+            <div className="stat-note">Missing or duplicate fields</div>
+          </div>
+        </section>
+
+        <div className="panel" style={{ padding: 22, marginTop: 20 }}>
+          <div className="eyebrow">VALIDATION REPORT</div>
+          <h2>All detected issues</h2>
+
+          {sheets.length === 0 ? (
+            <div className="empty-activity">
+              <strong>No workbook loaded</strong>
+              <p>Upload a workbook to start validation.</p>
+            </div>
+          ) : allAlerts.length === 0 ? (
+            <div className="empty-activity">
+              <div className="empty-icon">✓</div>
+              <strong>No supported issues detected</strong>
+              <p>
+                No matching validation issues were found by the current rules.
+              </p>
+            </div>
+          ) : (
+            <div style={{ display: "grid", gap: 10, marginTop: 16 }}>
+              {allAlerts.map((alert) => (
+                <button
+                  key={alert.id}
+                  onClick={() => openAlert(alert)}
+                  style={{
+                    display: "flex",
+                    alignItems: "flex-start",
+                    gap: 12,
+                    padding: 14,
+                    border: "1px solid var(--border-color, #ddd)",
+                    borderRadius: 9,
+                    background: "transparent",
+                    color: "inherit",
+                    textAlign: "left",
+                    cursor: "pointer",
+                  }}
+                >
+                  <strong
+                    style={{
+                      color:
+                        alert.severity === "critical"
+                          ? "#dc4444"
+                          : "#d18a20",
+                    }}
+                  >
+                    {alert.severity === "critical" ? "●" : "▲"}
+                  </strong>
+                  <span style={{ flex: 1 }}>
+                    <strong>{alert.title}</strong>
+                    <span
+                      style={{
+                        display: "block",
+                        fontSize: 13,
+                        marginTop: 5,
+                      }}
+                    >
+                      {alert.detail}
+                    </span>
+                    <small style={{ display: "block", marginTop: 7 }}>
+                      {alert.sheet} · {alert.cell}
+                    </small>
+                  </span>
+                  <span>View →</span>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      </>
+    );
+  }
+
+  function renderSheetSummary() {
+    const summary = currentSheet
+      ? DIMENSIONS.map((dimension) => ({
+          dimension,
+          result: collectDimension(sheets, dimension, selectedSheet),
+        }))
+      : [];
+
+    return (
+      <>
+        <section className="welcome-section">
+          <div>
+            <div className="eyebrow">ADVANCED WORKBOOK ANALYTICS</div>
+            <h1>Sheet Summary</h1>
+            <p>
+              Compare the complete workbook or focus on one individual worksheet.
+            </p>
+          </div>
+          <div className="welcome-mark">◉</div>
+        </section>
+
+        {sheets.length === 0 ? (
+          renderUpload()
+        ) : (
+          <>
+            <div className="panel" style={{ padding: 20 }}>
+              <div className="eyebrow">ANALYSIS SCOPE</div>
+              <h2>Select worksheet</h2>
+              <p className="workflow-intro">
+                Choose the entire workbook or an individual worksheet.
+              </p>
+
+              <select
+                value={selectedSheet}
+                onChange={(event) => setSelectedSheet(event.target.value)}
+                style={{
+                  width: "100%",
+                  maxWidth: 450,
+                  padding: 12,
+                  border: "1px solid var(--border-color, #ddd)",
+                  borderRadius: 8,
+                  marginTop: 12,
+                }}
+              >
+                {sheets.map((sheet) => (
+                  <option key={sheet.name} value={sheet.name}>
+                    {sheet.name}
+                  </option>
+                ))}
+              </select>
+
+              <button
+                className="empty-label"
+                style={{ marginLeft: 10 }}
+                onClick={() => setSelectedSheet(sheets[0]?.name || "")}
+              >
+                FIRST SHEET
+              </button>
+            </div>
+
+            <div className="stats-grid" style={{ marginTop: 20 }}>
+              <div className="stat-card">
+                <div className="stat-heading">SELECTED SHEET ROWS</div>
+                <div className="stat-value">
+                  {currentSheet?.rowCount.toLocaleString() || 0}
+                </div>
+                <div className="stat-note">Data rows</div>
+              </div>
+              <div className="stat-card">
+                <div className="stat-heading">COLUMNS</div>
+                <div className="stat-value">
+                  {currentSheet?.columnCount || 0}
+                </div>
+                <div className="stat-note">Detected columns</div>
+              </div>
+              <div className="stat-card">
+                <div className="stat-heading">FORMULAS</div>
+                <div className="stat-value">
+                  {currentSheet?.formulaCount || 0}
+                </div>
+                <div className="stat-note">Formula cells</div>
+              </div>
+              <div className="stat-card">
+                <div className="stat-heading">VALIDATION ALERTS</div>
+                <div className="stat-value">
+                  {currentSheet?.alerts.length || 0}
+                </div>
+                <div className="stat-note">Items for review</div>
+              </div>
+            </div>
+
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit,minmax(280px,1fr))",
+                gap: 18,
+                marginTop: 20,
+              }}
+            >
+              {summary.map(({ dimension, result }) => (
+                <DonutChart
+                  key={dimension.key}
+                  title={dimension.label}
+                  description={`Analysis for ${selectedSheet}`}
+                  data={result.found ? result.data : []}
+                />
+              ))}
+            </div>
+
+            {currentSheet && (
+              <div style={{ marginTop: 20 }}>
+                <BarChart
+                  title={`Top categories in ${currentSheet.name}`}
+                  data={summary
+                    .flatMap((item) => item.result.data)
+                    .sort((a, b) => b.value - a.value)
+                    .slice(0, 10)}
+                />
+              </div>
+            )}
+          </>
+        )}
+      </>
+    );
+  }
+
+  function renderHistory() {
+    return (
+      <>
+        <section className="welcome-section">
+          <div>
+            <div className="eyebrow">WORKSPACE RECORDS</div>
+            <h1>Import History</h1>
+            <p>Review files processed during this browser session.</p>
+          </div>
+          <div className="welcome-mark">↻</div>
+        </section>
+
+        <div className="panel" style={{ padding: 22 }}>
+          <div className="eyebrow">RECENT IMPORTS</div>
+          <h2>Workbook history</h2>
+
+          {history.length === 0 ? (
+            <div className="empty-activity">
+              <div className="empty-icon">◷</div>
+              <strong>No import history yet</strong>
+              <p>Imported workbooks will appear here.</p>
+            </div>
+          ) : (
+            <div style={{ overflowX: "auto", marginTop: 18 }}>
+              <table className="preview-table">
+                <thead>
+                  <tr>
+                    <th>File name</th>
+                    <th>Date</th>
+                    <th>Size</th>
+                    <th>Worksheets</th>
+                    <th>Rows</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {history.map((item, index) => (
+                    <tr key={`${item.name}-${index}`}>
+                      <td>{item.name}</td>
+                      <td>{item.date}</td>
+                      <td>{item.size}</td>
+                      <td>{item.sheets}</td>
+                      <td>{item.rows.toLocaleString()}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      </>
+    );
+  }
+
+  function renderSettings() {
+    return (
+      <>
+        <section className="welcome-section">
+          <div>
+            <div className="eyebrow">SYSTEM CONFIGURATION</div>
+            <h1>Settings</h1>
+            <p>Current workspace configuration and system information.</p>
+          </div>
+          <div className="welcome-mark">⚙</div>
+        </section>
+
+        <div className="panel" style={{ padding: 22 }}>
+          <div className="eyebrow">PROCESSING SETTINGS</div>
+          <h2>Data protection</h2>
+
+          {[
+            ["Source data modification", "Disabled"],
+            ["Automatic project merging", "Disabled"],
+            ["Automatic database synchronization", "Disabled"],
+            ["Excel file size limit", "20 MB"],
+            ["Supported file formats", "XLSX, XLS, CSV"],
+            ["Analysis mode", "Browser-based processing"],
+          ].map(([label, value]) => (
+            <div
+              key={label}
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                gap: 15,
+                padding: "15px 0",
+                borderBottom: "1px solid var(--border-color, #eee)",
+              }}
+            >
+              <strong>{label}</strong>
+              <span>{value}</span>
+            </div>
+          ))}
+
+          <div className="empty-activity" style={{ marginTop: 20 }}>
+            <strong>Future integration</strong>
+            <p>
+              AI model integration, Supabase synchronization, user
+              permissions and approval workflows will be implemented
+              in separate development stages.
+            </p>
+          </div>
+        </div>
+      </>
+    );
+  }
+
+  function renderActivePage() {
+    switch (activePage) {
+      case "Excel Intelligence":
+        return renderExcelIntelligence();
+      case "Project Matching":
+        return renderProjectMatching();
+      case "Data Validation":
+        return renderValidation();
+      case "Sheet Summary":
+        return renderSheetSummary();
+      case "Import History":
+        return renderHistory();
+      case "Settings":
+        return renderSettings();
+      default:
+        return renderOverview();
+    }
+  }
+
+  return (
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="brand">
+          <div className="brand-icon">O</div>
+          <div>
+            <h2>
+              OSP <span>AI</span>
+            </h2>
+            <p>INTELLIGENCE AGENT</p>
+          </div>
+        </div>
+
+        <div className="workspace-label">WORKSPACE</div>
+
+        <nav className="navigation">
+          {navigation.map((item) => (
+            <button
+              key={item.name}
+              className={`nav-item ${
+                activePage === item.name ? "active" : ""
+              }`}
+              onClick={() => setActivePage(item.name)}
+            >
+              <span className="nav-icon">{item.icon}</span>
+              {item.name}
+
+              {item.name === "Data Validation" && totalAlerts > 0 && (
+                <span className="notification-count">
+                  {totalAlerts}
+                </span>
+              )}
+
+              {item.name === "Project Matching" && matches.length > 0 && (
+                <span className="notification-count">
+                  {matches.length}
+                </span>
+              )}
+            </button>
+          ))}
+        </nav>
+
+        <div className="sidebar-bottom">
+          <div className="system-status">
+            <span className="status-dot" />
+            <div>
+              <strong>System Online</strong>
+              <small>Independent AI Workspace</small>
+            </div>
+          </div>
+          <div className="version">OSP AI Agent · Version 2.0</div>
+        </div>
+      </aside>
+
+      <main className="main-content">
+        <header className="topbar">
+          <div>
+            <span className="breadcrumb">OSP / AI Workspace / </span>
+            <strong>{activePage}</strong>
+          </div>
+
+          <div className="topbar-right">
+            {totalAlerts > 0 && (
+              <button
+                className="notification-button"
+                onClick={() => setActivePage("Data Validation")}
+                title="View notifications"
+              >
+                <span>♢</span>
+                <strong>{totalAlerts}</strong>
+              </button>
+            )}
+
+            <span className="environment">DEVELOPMENT</span>
+            <div className="avatar">A</div>
+          </div>
+        </header>
+
+        {renderActivePage()}
+
+        <footer className="footer">
+          <span>OSP AI Agent · Independent Intelligence Workspace</span>
+          <span>Built for OSP Project Intelligence Hub</span>
+        </footer>
+      </main>
+    </div>
+  );
+}
+
+export default App;
